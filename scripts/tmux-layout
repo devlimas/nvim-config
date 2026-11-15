@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# tmux-layout: nvim (60%) à esquerda, agente (40%) à direita, no diretório atual
+#
+# Uso: tmux-layout [-a agente] [-m] [nome-da-sessao]
+#   -a agente   codex | opencode | claude (ou qualquer comando)
+#   -m          abre um menu: popup do tmux (dentro do tmux) ou fzf/select (fora)
+#
+# Exemplo: tmux-layout -a claude
+
+set -u
+
+AGENTS=(codex opencode claude)
+KEYS=(c o l)   # atalhos do popup, na mesma ordem de AGENTS
+agent="${AGENT:-codex}"
+menu=0
+
+while getopts "a:mh" opt; do
+  case "$opt" in
+    a) agent="$OPTARG" ;;
+    m) menu=1 ;;
+    h|*) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+# Entre aspas simples do tmux, mesmo que o texto contenha ' (ex.: pasta "Joao's").
+tmux_quote() {
+  local s=${1//\'/\'\"\'\"\'}
+  printf "'%s'" "$s"
+}
+
+if [ "$menu" = 1 ]; then
+  if [ -n "${TMUX:-}" ]; then
+    # Dentro do tmux: popup nativo. Cada item reexecuta este script com -a <agente>.
+    self=$(realpath "$0" 2>/dev/null || echo "$0")
+    items=()
+    for i in "${!AGENTS[@]}"; do
+      a="${AGENTS[$i]}"
+      shell_cmd="cd -- $(printf '%q' "$PWD") && $(printf '%q -a %q' "$self" "$a")"
+      [ -n "${1:-}" ] && shell_cmd+=" $(printf '%q' "$1")"
+      items+=("$a" "${KEYS[$i]:-}" "run-shell $(tmux_quote "$shell_cmd")")
+    done
+    items+=("" "Sair" "q" "")   # separador + sair (comando vazio só fecha o menu)
+    tmux display-menu -T "#[align=centre] Agente " -x C -y C "${items[@]}"
+    exit 0
+  elif command -v fzf >/dev/null 2>&1; then
+    # Esc ou Ctrl-C também desistem
+    agent=$(printf '%s\n' "${AGENTS[@]}" | fzf --prompt='agente (Esc sai)> ' --height=10 --reverse) || exit 0
+  else
+    while true; do
+      for i in "${!AGENTS[@]}"; do
+        printf '%d) %s\n' "$((i + 1))" "${AGENTS[$i]}"
+      done
+      echo "q) Sair"
+      read -r -p "Escolha o agente: " reply || exit 0
+      case "$reply" in
+        q|Q) exit 0 ;;
+        ''|*[!0-9]*) echo "Opção inválida" >&2 ;;
+        *)
+          if [ "$reply" -ge 1 ] && [ "$reply" -le "${#AGENTS[@]}" ]; then
+            agent="${AGENTS[$((reply - 1))]}"
+            break
+          fi
+          echo "Opção inválida" >&2
+          ;;
+      esac
+    done
+  fi
+fi
+
+# Dependências: tmux, nvim e o agente escolhido
+for cmd in tmux nvim "${agent%% *}"; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "tmux-layout: '$cmd' não encontrado no PATH" >&2
+    exit 1
+  fi
+done
+
+name="${1:-$(basename "$PWD" | tr '.:' '--')}"
+
+# Fora do tmux: se a sessão já existe, só anexa em vez de recriar
+if [ -z "${TMUX:-}" ] && tmux has-session -t "=$name" 2>/dev/null; then
+  echo "tmux-layout: sessão '$name' já existe, anexando" >&2
+  exec tmux attach-session -t "=$name"
+fi
+
+# AGENT vai no ambiente do painel do nvim: o avante segue o agente escolhido aqui
+if [ -n "${TMUX:-}" ]; then
+  left=$(tmux new-window -P -F '#{pane_id}' -e NO_FETCH=1 -e "AGENT=$agent" -c "$PWD" -n "$name")
+else
+  left=$(tmux new-session -d -P -F '#{pane_id}' -e NO_FETCH=1 -e "AGENT=$agent" -s "$name" -n "$name" -c "$PWD" \
+          -x "$(tput cols)" -y "$(tput lines)")
+fi
+right=$(tmux split-window -h -l 40% -P -F '#{pane_id}' -e NO_FETCH=1 -t "$left" -c "$PWD")
+
+# sem rótulos nem linha de borda, mesmo que o tmux.conf ative pane-border-status globalmente
+tmux set-option -w -t "$left" pane-border-status off
+
+tmux send-keys -t "$right" "$agent" C-m
+tmux send-keys -t "$left"  "nvim ." C-m
+tmux select-pane -t "$left"
+
+if [ -z "${TMUX:-}" ]; then tmux attach-session -t "$name"; fi
